@@ -29,7 +29,6 @@ from sqlglot.dialects.dialect import (
     unit_to_str,
     sequence_sql,
     build_regexp_extract,
-    explode_to_unnest_sql,
 )
 from sqlglot.dialects.hive import Hive
 from sqlglot.dialects.mysql import MySQL
@@ -70,7 +69,9 @@ def _schema_sql(self: Denodo.Generator, expression: exp.Schema) -> str:
 
 def _quantile_sql(self: Denodo.Generator, expression: exp.Quantile) -> str:
     self.unsupported("Denodo does not support exact quantiles")
-    return self.func("APPROX_PERCENTILE", expression.this, expression.args.get("quantile"))
+    return self.func(
+        "APPROX_PERCENTILE", expression.this, expression.args.get("quantile")
+    )
 
 
 def _str_to_time_sql(
@@ -82,9 +83,14 @@ def _str_to_time_sql(
 def _ts_or_ds_to_date_sql(self: Denodo.Generator, expression: exp.TsOrDsToDate) -> str:
     time_format = self.format_time(expression)
     if time_format and time_format not in (Denodo.TIME_FORMAT, Denodo.DATE_FORMAT):
-        return self.sql(exp.cast(_str_to_time_sql(self, expression), exp.DataType.Type.DATE))
+        return self.sql(
+            exp.cast(_str_to_time_sql(self, expression), exp.DataType.Type.DATE)
+        )
     return self.sql(
-        exp.cast(exp.cast(expression.this, exp.DataType.Type.TIMESTAMP), exp.DataType.Type.DATE)
+        exp.cast(
+            exp.cast(expression.this, exp.DataType.Type.TIMESTAMP),
+            exp.DataType.Type.DATE,
+        )
     )
 
 
@@ -137,7 +143,9 @@ def _first_last_sql(self: Denodo.Generator, expression: exp.Func) -> str:
 
     Reference: https://trino.io/docs/current/sql/match-recognize.html#logical-navigation-functions
     """
-    if isinstance(expression.find_ancestor(exp.MatchRecognize, exp.Select), exp.MatchRecognize):
+    if isinstance(
+        expression.find_ancestor(exp.MatchRecognize, exp.Select), exp.MatchRecognize
+    ):
         return self.function_fallback_sql(expression)
 
     return rename_func("ARBITRARY")(self, expression)
@@ -168,9 +176,21 @@ def _build_to_char(args: t.List) -> exp.TimeToStr:
         # We uppercase this to match Teradata's format mapping keys
         fmt.set("this", fmt.this.upper())
 
-    # We use "teradata" on purpose here, because the time formats are different in Denodo.
-    # See https://prestodb.io/docs/current/functions/teradata.html?highlight=to_char#to_char
     return build_formatted_time(exp.TimeToStr, "teradata")(args)
+
+
+def _date_add_sql(
+    kind: str,
+) -> t.Callable[[generator.Generator, exp.Expression], str]:
+    def func(self: generator.Generator, expression: exp.Expression) -> str:
+        print("asdkajlsdlaksd")
+        return self.func(
+            f"ADDDAY",
+            expression.this,
+            exp.Interval(this=expression.expression, unit=expression),
+        )
+
+    return func
 
 
 def _date_delta_sql(
@@ -178,6 +198,7 @@ def _date_delta_sql(
 ) -> t.Callable[[Denodo.Generator, DATE_ADD_OR_SUB], str]:
     def _delta_sql(self: Denodo.Generator, expression: DATE_ADD_OR_SUB) -> str:
         interval = _to_int(self, expression.expression)
+        print("lol")
         return self.func(
             name,
             unit_to_str(expression),
@@ -188,24 +209,46 @@ def _date_delta_sql(
     return _delta_sql
 
 
-def _build_pad(args: t.List, is_left: bool = True):
+def _build_pad_parser(args: t.List, is_left: bool) -> exp.Pad:
+    """Creates an exp.Pad expression from parsed arguments."""
+    # seq_get gracefully handles missing optional arguments like fill_pattern
     return exp.Pad(
         this=seq_get(args, 0),
-        expression=seq_get(args, 1),
-        fill_pattern=seq_get(args, 2),
-        is_left=is_left,
+        expression=seq_get(args, 1),  # This is the length argument
+        fill_pattern=seq_get(args, 2),  # Optional fill pattern
+        # Set the crucial is_left flag in the expression's args dictionary
+        args={"is_left": is_left},
     )
 
 
+# This function now explicitly handles exp.Pad
 def _pad_sql(self: Denodo.Generator, expression: exp.Pad) -> str:
-    this = self.sql(expression, "this")
-    expr = self.sql(expression, "expression")
-    fill_pattern = self.sql(expression, "fill_pattern") or "' '"  # Default to space if not provided
+    """
+    Generates SQL for LPAD or RPAD functions from an exp.Pad expression.
 
-    if expression.args.get("is_left"):
-        return self.func("LEFTPAD", this, expr, fill_pattern)  # Changed to LEFTPAD
-    else:
-        return self.func("RPAD", this, this, expr, fill_pattern)  # RPAD remains the same
+    Denodo typically uses LPAD and RPAD with three arguments:
+    LPAD(string, length, fill_pattern)
+    RPAD(string, length, fill_pattern)
+
+    SQLGlot's exp.Pad stores:
+        - string in 'this'
+        - length in 'expression'
+        - fill_pattern in 'fill_pattern' (within args)
+        - direction in 'is_left' (within args)
+    """
+    this = self.sql(expression, "this")
+    length = self.sql(expression, "expression")
+    # Default fill pattern to a single space if not provided
+    fill_pattern = self.sql(expression.args.get("fill_pattern")) or "' '"
+
+    # Determine the correct Denodo function name based on the is_left flag
+    is_left = expression.args.get("is_left", True)  # Default to LPAD if flag missing
+    func_name = "LPAD" if is_left else "RPAD"
+    # If Denodo uses different names (e.g., LEFTPAD), adjust here:
+    # func_name = "LEFTPAD" if is_left else "RPAD"
+
+    # Generate the function call using the determined name and arguments
+    return self.func(func_name, this, length, fill_pattern)
 
 
 class Denodo(Dialect):
@@ -221,13 +264,8 @@ class Denodo(Dialect):
 
     TIME_MAPPING = MySQL.TIME_MAPPING
 
-    # https://github.com/trinodb/trino/issues/17
-    # https://github.com/trinodb/trino/issues/12289
-    # https://github.com/prestodb/presto/issues/2863
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
 
-    # The result of certain math functions in Denodo/Trino is of type
-    # equal to the input type e.g: FLOOR(5.5/2) -> DECIMAL, FLOOR(5/2) -> BIGINT
     ANNOTATORS = {
         **Dialect.ANNOTATORS,
         exp.Floor: lambda self, e: self._annotate_by_args(e, "this"),
@@ -279,27 +317,43 @@ class Denodo(Dialect):
             "BITWISE_XOR": binary_from_function(exp.BitwiseXor),
             "CARDINALITY": exp.ArraySize.from_arg_list,
             "CONTAINS": exp.ArrayContains.from_arg_list,
-            "DATE_ADD": lambda args: exp.DateAdd(
-                this=seq_get(args, 2), expression=seq_get(args, 1), unit=seq_get(args, 0)
+            "ADDDAY": lambda args: exp.DateAdd(
+                this=seq_get(args, 2),
+                expression=seq_get(args, 1),
+                unit=seq_get(args, 0),
+            ),
+            "ADDHOUR": lambda args: exp.TimestampAdd(
+                this=seq_get(
+                    args, 0
+                ),  # First arg is the value (time, timestamp, interval)
+                expression=seq_get(args, 1),  # Second arg is the increment (hours)
+                unit=exp.Literal.string("HOUR"),  # Explicitly set the unit
             ),
             "DATE_DIFF": lambda args: exp.DateDiff(
-                this=seq_get(args, 2), expression=seq_get(args, 1), unit=seq_get(args, 0)
+                this=seq_get(args, 2),
+                expression=seq_get(args, 1),
+                unit=seq_get(args, 0),
             ),
-            "DATE_FORMAT": build_formatted_time(exp.TimeToStr, "denodo"),
+            "FORMATDATE": build_formatted_time(exp.TimeToStr, "denodo"),
             "DATE_PARSE": build_formatted_time(exp.StrToTime, "denodo"),
             "DAY_OF_WEEK": exp.DayOfWeekIso.from_arg_list,
             "ELEMENT_AT": lambda args: exp.Bracket(
-                this=seq_get(args, 0), expressions=[seq_get(args, 1)], offset=1, safe=True
+                this=seq_get(args, 0),
+                expressions=[seq_get(args, 1)],
+                offset=1,
+                safe=True,
             ),
             "FROM_HEX": exp.Unhex.from_arg_list,
             "FROM_UNIXTIME": _build_from_unixtime,
             "FROM_UTF8": lambda args: exp.Decode(
-                this=seq_get(args, 0), replace=seq_get(args, 1), charset=exp.Literal.string("utf-8")
+                this=seq_get(args, 0),
+                replace=seq_get(args, 1),
+                charset=exp.Literal.string("utf-8"),
             ),
             "LEVENSHTEIN_DISTANCE": exp.Levenshtein.from_arg_list,
             "NOW": exp.CurrentTimestamp.from_arg_list,
-            "LPAD": _build_pad,
-            "RPAD": lambda args: _pad_sql(args, is_left=False),
+            "LPAD": lambda args: _build_pad_parser(args, is_left=True),
+            "RPAD": lambda args: _build_pad_parser(args, is_left=False),
             "REGEXP_EXTRACT": build_regexp_extract(exp.RegexpExtract),
             "REGEXP_EXTRACT_ALL": build_regexp_extract(exp.RegexpExtractAll),
             "REGEXP": lambda args: exp.RegexpReplace(
@@ -312,7 +366,9 @@ class Denodo(Dialect):
             "SET_AGG": exp.ArrayUniqueAgg.from_arg_list,
             "SPLIT_TO_MAP": exp.StrToMap.from_arg_list,
             "STRPOS": lambda args: exp.StrPosition(
-                this=seq_get(args, 0), substr=seq_get(args, 1), occurrence=seq_get(args, 2)
+                this=seq_get(args, 0),
+                substr=seq_get(args, 1),
+                occurrence=seq_get(args, 2),
             ),
             "TO_CHAR": _build_to_char,
             "TO_UNIXTIME": exp.TimeToUnix.from_arg_list,
@@ -320,8 +376,12 @@ class Denodo(Dialect):
                 this=seq_get(args, 0), charset=exp.Literal.string("utf-8")
             ),
             "MD5": exp.MD5Digest.from_arg_list,
-            "SHA256": lambda args: exp.SHA2(this=seq_get(args, 0), length=exp.Literal.number(256)),
-            "SHA512": lambda args: exp.SHA2(this=seq_get(args, 0), length=exp.Literal.number(512)),
+            "SHA256": lambda args: exp.SHA2(
+                this=seq_get(args, 0), length=exp.Literal.number(256)
+            ),
+            "SHA512": lambda args: exp.SHA2(
+                this=seq_get(args, 0), length=exp.Literal.number(512)
+            ),
         }
 
         FUNCTION_PARSERS = parser.Parser.FUNCTION_PARSERS.copy()
@@ -383,29 +443,36 @@ class Denodo(Dialect):
             exp.ArrayToString: rename_func("ARRAY_JOIN"),
             exp.ArrayUniqueAgg: rename_func("SET_AGG"),
             exp.AtTimeZone: rename_func("AT_TIMEZONE"),
-            exp.BitwiseAnd: lambda self, e: self.func("BITWISE_AND", e.this, e.expression),
+            exp.BitwiseAnd: lambda self, e: self.func(
+                "BITWISE_AND", e.this, e.expression
+            ),
             exp.BitwiseLeftShift: lambda self, e: self.func(
                 "BITWISE_ARITHMETIC_SHIFT_LEFT", e.this, e.expression
             ),
             exp.BitwiseNot: lambda self, e: self.func("BITWISE_NOT", e.this),
-            exp.BitwiseOr: lambda self, e: self.func("BITWISE_OR", e.this, e.expression),
+            exp.BitwiseOr: lambda self, e: self.func(
+                "BITWISE_OR", e.this, e.expression
+            ),
             exp.BitwiseRightShift: lambda self, e: self.func(
                 "BITWISE_ARITHMETIC_SHIFT_RIGHT", e.this, e.expression
             ),
-            exp.BitwiseXor: lambda self, e: self.func("BITWISE_XOR", e.this, e.expression),
+            exp.BitwiseXor: lambda self, e: self.func(
+                "BITWISE_XOR", e.this, e.expression
+            ),
             exp.Cast: transforms.preprocess([transforms.epoch_cast_to_ts]),
-            exp.CurrentTime: lambda *_: "CURRENT_TIME",
+            exp.CurrentTime: lambda *_: "CURRENT_TIMESTAMP",
             exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP",
             exp.CurrentUser: lambda *_: "CURRENT_USER",
-            exp.DateAdd: _date_delta_sql("DATE_ADD"),
+            exp.DateSub: _date_add_sql("SUB"),
             exp.DateDiff: lambda self, e: self.func(
                 "DATE_DIFF", unit_to_str(e), e.expression, e.this
             ),
             exp.DateStrToDate: datestrtodate_sql,
             exp.DateToDi: lambda self,
             e: f"CAST(DATE_FORMAT({self.sql(e, 'this')}, {Denodo.DATEINT_FORMAT}) AS INT)",
-            exp.DateSub: _date_delta_sql("DATE_ADD", negate_interval=True),
-            exp.DayOfWeek: lambda self, e: f"(({self.func('DAY_OF_WEEK', e.this)} % 7) + 1)",
+            exp.DateAdd: _date_add_sql("ADD"),
+            exp.DayOfWeek: rename_func("GETDAYOFWEEK"),
+            exp.DayOfYear: rename_func("GETDAYOFYEAR"),
             exp.DayOfWeekIso: rename_func("DAY_OF_WEEK"),
             exp.Decode: lambda self, e: encode_decode_sql(self, e, "FROM_UTF8"),
             exp.DiToDate: lambda self,
@@ -424,11 +491,12 @@ class Denodo(Dialect):
             exp.JSONExtract: lambda self, e: self.jsonextract_sql(e),
             exp.Last: _first_last_sql,
             exp.LastDay: lambda self, e: self.func("LAST_DAY_OF_MONTH", e.this),
-            exp.Lateral: explode_to_unnest_sql,
             exp.Left: left_to_substring_sql,
-            exp.Levenshtein: unsupported_args("ins_cost", "del_cost", "sub_cost", "max_dist")(
-                rename_func("LEVENSHTEIN_DISTANCE")
-            ),
+            exp.Pad: _pad_sql,  # Handle the generic exp.Pad expression
+            exp.Levenshtein: unsupported_args(
+                "ins_cost", "del_cost", "sub_cost", "max_dist"
+            )(rename_func("LEVENSHTEIN_DISTANCE")),
+            exp.Length: rename_func("LEN"),
             exp.LogicalAnd: rename_func("BOOL_AND"),
             exp.LogicalOr: rename_func("BOOL_OR"),
             # exp.Hex: lambda self, e: self.func("UPPER", self.func("TO_HEX", self.sql(e, "this"))),
@@ -442,14 +510,14 @@ class Denodo(Dialect):
             exp.SchemaCommentProperty: lambda self, e: self.naked_property(e),
             exp.Select: transforms.preprocess(
                 [
-                    transforms.eliminate_qualify,
-                    transforms.eliminate_distinct_on,
-                    transforms.explode_to_unnest(1),
                     transforms.eliminate_semi_and_anti_joins,
+                    transforms.eliminate_qualify,
                 ]
             ),
             exp.SortArray: _no_sort_array,
-            exp.StrPosition: lambda self, e: strposition_sql(self, e, supports_occurrence=True),
+            exp.StrPosition: lambda self, e: strposition_sql(
+                self, e, supports_occurrence=True
+            ),
             exp.StrToDate: lambda self, e: f"CAST({_str_to_time_sql(self, e)} AS DATE)",
             exp.StrToMap: rename_func("SPLIT_TO_MAP"),
             exp.StrToTime: _str_to_time_sql,
@@ -462,9 +530,13 @@ class Denodo(Dialect):
             exp.TimeStrToUnix: lambda self, e: self.func(
                 "TO_UNIXTIME", self.func("DATE_PARSE", e.this, Denodo.TIME_FORMAT)
             ),
-            exp.TimeToStr: lambda self, e: self.func("DATE_FORMAT", e.this, self.format_time(e)),
+            exp.TimeToStr: lambda self, e: self.func(
+                "FORMATDATE", self.format_time(e), e.this
+            ),
             exp.TimeToUnix: rename_func("TO_UNIXTIME"),
-            exp.ToChar: lambda self, e: self.func("DATE_FORMAT", e.this, self.format_time(e)),
+            exp.ToChar: lambda self, e: self.func(
+                "FORMATDATE", self.format_time(e), e.this
+            ),
             exp.TryCast: transforms.preprocess([transforms.epoch_cast_to_ts]),
             exp.TsOrDiToDi: lambda self,
             e: f"CAST(SUBSTR(REPLACE(CAST({self.sql(e, 'this')} AS VARCHAR), '-', ''), 1, 8) AS INT)",
@@ -478,7 +550,10 @@ class Denodo(Dialect):
             exp.UnixToTimeStr: lambda self,
             e: f"CAST(FROM_UNIXTIME({self.sql(e, 'this')}) AS VARCHAR)",
             exp.VariancePop: rename_func("VAR_POP"),
-            exp.With: transforms.preprocess([transforms.add_recursive_cte_column_names]),
+            exp.WeekOfYear: rename_func("GETWEEK"),
+            exp.With: transforms.preprocess(
+                [transforms.add_recursive_cte_column_names]
+            ),
             exp.WithinGroup: transforms.preprocess(
                 [transforms.remove_within_group_for_percentiles]
             ),
@@ -560,7 +635,9 @@ class Denodo(Dialect):
             if this.is_type(*exp.DataType.TEXT_TYPES):
                 this = exp.Encode(this=this, charset=exp.Literal.string("utf-8"))
 
-            return self.func("LOWER", self.func("TO_HEX", self.func("MD5", self.sql(this))))
+            return self.func(
+                "LOWER", self.func("TO_HEX", self.func("MD5", self.sql(this)))
+            )
 
         def strtounix_sql(self, expression: exp.StrToUnix) -> str:
             # Since `TO_UNIXTIME` requires a `TIMESTAMP`, we need to parse the argument into one.
@@ -574,7 +651,9 @@ class Denodo(Dialect):
                 exp.cast(this, exp.DataType.Type.TIMESTAMP) if this.is_string else this
             )
 
-            parse_without_tz = self.func("DATE_PARSE", value_as_text, self.format_time(expression))
+            parse_without_tz = self.func(
+                "DATE_PARSE", value_as_text, self.format_time(expression)
+            )
 
             formatted_value = self.func(
                 "DATE_FORMAT", value_as_timestamp, self.format_time(expression)
@@ -582,9 +661,13 @@ class Denodo(Dialect):
             parse_with_tz = self.func(
                 "PARSE_DATETIME",
                 formatted_value,
-                self.format_time(expression, Hive.INVERSE_TIME_MAPPING, Hive.INVERSE_TIME_TRIE),
+                self.format_time(
+                    expression, Hive.INVERSE_TIME_MAPPING, Hive.INVERSE_TIME_TRIE
+                ),
             )
-            coalesced = self.func("COALESCE", self.func("TRY", parse_without_tz), parse_with_tz)
+            coalesced = self.func(
+                "COALESCE", self.func("TRY", parse_without_tz), parse_with_tz
+            )
             return self.func("TO_UNIXTIME", coalesced)
 
         def bracket_sql(self, expression: exp.Bracket) -> str:
@@ -637,7 +720,10 @@ class Denodo(Dialect):
             return super().interval_sql(expression)
 
         def offset_limit_modifiers(
-            self, expression: exp.Expression, fetch: bool, limit: t.Optional[exp.Fetch | exp.Limit]
+            self,
+            expression: exp.Expression,
+            fetch: bool,
+            limit: t.Optional[exp.Fetch | exp.Limit],
         ) -> t.List[str]:
             return [
                 self.sql(expression, "offset"),
@@ -662,18 +748,25 @@ class Denodo(Dialect):
                 table_alias = table.args.get("alias")
                 if table_alias:
                     table_alias.pop()
-                    expression = t.cast(exp.Delete, expression.transform(unqualify_columns))
+                    expression = t.cast(
+                        exp.Delete, expression.transform(unqualify_columns)
+                    )
 
             return super().delete_sql(expression)
 
         def jsonextract_sql(self, expression: exp.JSONExtract) -> str:
-            is_json_extract = self.dialect.settings.get("variant_extract_is_json_extract", True)
+            is_json_extract = self.dialect.settings.get(
+                "variant_extract_is_json_extract", True
+            )
 
             # Generate JSON_EXTRACT unless the user has configured that a Snowflake / Databricks
             # VARIANT extract (e.g. col:x.y) should map to dot notation (i.e ROW access) in Denodo/Trino
             if not expression.args.get("variant_extract") or is_json_extract:
                 return self.func(
-                    "JSON_EXTRACT", expression.this, expression.expression, *expression.expressions
+                    "JSON_EXTRACT",
+                    expression.this,
+                    expression.expression,
+                    *expression.expressions,
                 )
 
             this = self.sql(expression, "this")
